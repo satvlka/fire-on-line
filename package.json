@@ -1,0 +1,13 @@
+{
+  "name": "distance-alert-server",
+  "version": "1.0.0",
+  "description": "MVP distance sensor alert dashboard with webcam",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.16.0"
+  }
+}
