@@ -70,7 +70,7 @@ wss.on('connection', ws => {
 });
 
 // ── Start ──────────────────────────────────────────────────────────
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   const ifaces = os.networkInterfaces();
   let localIP  = 'localhost';
   Object.values(ifaces).flat().forEach(i => {
@@ -356,7 +356,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <span id="cam-status">Standby</span>
   </div>
   <div id="cam-body">
-    <video id="video" autoplay playsinline muted></video>
+    <video id="video" autoplay playsinline muted style="display:none"></video>
+    <canvas id="cam-canvas" style="width:100%;max-height:420px;display:none;"></canvas>
     <div id="cam-placeholder">
       <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
         <path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/>
@@ -454,15 +455,264 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   let lastTriggered = false;
 
   // ── Camera ────────────────────────────────────────────────────────
+  const canvas      = $('cam-canvas');
+  const ctx         = canvas.getContext('2d');
+  let   animFrame   = null;
+  let   vegCount    = 0;
+
+  // ── RGB → HSV ────────────────────────────────────────────────────
+  function rgbToHsv(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r,g,b), min = Math.min(r,g,b), d = max - min;
+    let h = 0, s = max === 0 ? 0 : d / max, v = max;
+    if (d !== 0) {
+      if      (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+      else if (max === g) h = ((b - r) / d + 2) / 6;
+      else                h = ((r - g) / d + 4) / 6;
+    }
+    return [h * 360, s * 100, v * 100];
+  }
+
+  // ── Find bounding boxes of green clusters ─────────────────────────
+  function findGreenBoxes(imageData, w, h) {
+  const mask  = new Uint8Array(w * h);
+  const data  = imageData.data;
+
+  // 🔧 Looser green detection
+  for (let i = 0; i < w * h; i++) {
+    const r = data[i*4], g = data[i*4+1], b = data[i*4+2];
+    const [hue, sat, val] = rgbToHsv(r, g, b);
+
+    if (
+      hue >= 60 && hue <= 180 &&
+      sat >= 15 &&
+      val >= 10
+    ) {
+      mask[i] = 1;
+    }
+  }
+
+  const CELL = 20;
+  const cols = Math.floor(w / CELL), rows = Math.floor(h / CELL);
+  const boxes = [];
+  const visited = new Uint8Array(cols * rows);
+
+  function countCell(cx, cy) {
+    let count = 0;
+    for (let dy = 0; dy < CELL; dy++)
+      for (let dx = 0; dx < CELL; dx++) {
+        const px = cx * CELL + dx, py = cy * CELL + dy;
+        if (px < w && py < h && mask[py * w + px]) count++;
+      }
+    return count;
+  }
+
+  for (let cy = 0; cy < rows; cy++) {
+    for (let cx = 0; cx < cols; cx++) {
+      const idx = cy * cols + cx;
+
+      // 🔧 Less strict cell threshold
+      if (visited[idx] || countCell(cx, cy) < CELL * CELL * 0.08) continue;
+
+      const queue = [[cx, cy]];
+      visited[idx] = 1;
+
+      let minX = cx, maxX = cx, minY = cy, maxY = cy;
+
+      while (queue.length) {
+        const [qx, qy] = queue.shift();
+
+        minX = Math.min(minX, qx);
+        maxX = Math.max(maxX, qx);
+        minY = Math.min(minY, qy);
+        maxY = Math.max(maxY, qy);
+
+        for (const [nx, ny] of [[qx-1,qy],[qx+1,qy],[qx,qy-1],[qx,qy+1]]) {
+          const ni = ny * cols + nx;
+
+          if (
+            nx >= 0 && nx < cols &&
+            ny >= 0 && ny < rows &&
+            !visited[ni] &&
+            countCell(nx, ny) >= CELL * CELL * 0.05
+          ) {
+            visited[ni] = 1;
+            queue.push([nx, ny]);
+          }
+        }
+      }
+
+      const bw = (maxX - minX + 1) * CELL;
+      const bh = (maxY - minY + 1) * CELL;
+
+      // 🔧 Smaller box threshold
+      if (bw * bh > 400) {
+        boxes.push([minX * CELL, minY * CELL, bw, bh]);
+      }
+    }
+  }
+
+  return boxes;
+}
+  // ── Draw loop ─────────────────────────────────────────────────────
+  function drawFrame() {
+    if (!camStream) return;
+    canvas.width  = video.videoWidth  || 640;
+    canvas.height = video.videoHeight || 480;
+
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+    const boxes     = findGreenBoxes(imageData, canvas.width, canvas.height);
+
+    vegCount = boxes.length;
+
+    boxes.forEach(([x, y, w, h]) => {
+      // Box
+      ctx.strokeStyle = '#22c55e';
+      ctx.lineWidth   = 2.5;
+      ctx.strokeRect(x, y, w, h);
+      // Label background
+      ctx.fillStyle = '#22c55e';
+      ctx.fillRect(x, y - 22, 110, 22);
+      // Label text
+      ctx.fillStyle   = '#fff';
+      ctx.font        = 'bold 13px system-ui';
+      ctx.fillText(vegCount > 0 ? '✔ ' + vegCount + ' vegetation zone' + (vegCount>1?'s':'') + ' detected' : 'No vegetation detected', 16, 26);
+    });
+
+    // HUD overlay
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(8, 8, 190, 28);
+    ctx.fillStyle = vegCount > 0 ? '#22c55e' : '#9ca3af';
+    ctx.font      = 'bold 13px system-ui';
+    ctx.fillText(vegCount > 0 ? '✔ ' + vegCount + ' vegetation zone' + (vegCount>1?'s':'') + ' detected' : 'No vegetation detected', 16, 27);
+
+    animFrame = requestAnimationFrame(drawFrame);
+  }
+
+  const canvas      = $('cam-canvas');
+  const ctx         = canvas.getContext('2d');
+  let   animFrame   = null;
+  let   vegCount    = 0;
+
+  // ── RGB → HSV ────────────────────────────────────────────────────
+  function rgbToHsv(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r,g,b), min = Math.min(r,g,b), d = max - min;
+    let h = 0, s = max === 0 ? 0 : d / max, v = max;
+    if (d !== 0) {
+      if      (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+      else if (max === g) h = ((b - r) / d + 2) / 6;
+      else                h = ((r - g) / d + 4) / 6;
+    }
+    return [h * 360, s * 100, v * 100];
+  }
+
+  // ── Find bounding boxes of green clusters ─────────────────────────
+  function findGreenBoxes(imageData, w, h) {
+    const mask  = new Uint8Array(w * h);
+    const data  = imageData.data;
+
+    // Mark green pixels
+    for (let i = 0; i < w * h; i++) {
+      const r = data[i*4], g = data[i*4+1], b = data[i*4+2];
+      const [hue, sat, val] = rgbToHsv(r, g, b);
+      if (hue >= 65 && hue <= 165 && sat >= 25 && val >= 15) mask[i] = 1;
+    }
+
+    // Simple scanline to find connected regions (grid cells approach)
+    const CELL = 20;
+    const cols = Math.floor(w / CELL), rows = Math.floor(h / CELL);
+    const boxes = [];
+    const visited = new Uint8Array(cols * rows);
+
+    function countCell(cx, cy) {
+      let count = 0;
+      for (let dy = 0; dy < CELL; dy++)
+        for (let dx = 0; dx < CELL; dx++) {
+          const px = cx * CELL + dx, py = cy * CELL + dy;
+          if (px < w && py < h && mask[py * w + px]) count++;
+        }
+      return count;
+    }
+
+    // BFS over cells
+    for (let cy = 0; cy < rows; cy++) {
+      for (let cx = 0; cx < cols; cx++) {
+        const idx = cy * cols + cx;
+        if (visited[idx] || countCell(cx, cy) < CELL * CELL * 0.25) continue;
+        // BFS
+        const queue = [[cx, cy]];
+        visited[idx] = 1;
+        let minX = cx, maxX = cx, minY = cy, maxY = cy;
+        while (queue.length) {
+          const [qx, qy] = queue.shift();
+          if (qx < minX) minX = qx; if (qx > maxX) maxX = qx;
+          if (qy < minY) minY = qy; if (qy > maxY) maxY = qy;
+          for (const [nx, ny] of [[qx-1,qy],[qx+1,qy],[qx,qy-1],[qx,qy+1]]) {
+            const ni = ny * cols + nx;
+            if (nx >= 0 && nx < cols && ny >= 0 && ny < rows && !visited[ni] && countCell(nx, ny) >= CELL * CELL * 0.2) {
+              visited[ni] = 1;
+              queue.push([nx, ny]);
+            }
+          }
+        }
+        const bw = (maxX - minX + 1) * CELL, bh = (maxY - minY + 1) * CELL;
+        if (bw * bh > 1200) boxes.push([minX * CELL, minY * CELL, bw, bh]);
+      }
+    }
+    return boxes;
+  }
+
+  // ── Draw loop ─────────────────────────────────────────────────────
+  function drawFrame() {
+    if (!camStream) return;
+    canvas.width  = video.videoWidth  || 640;
+    canvas.height = video.videoHeight || 480;
+
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const boxes     = findGreenBoxes(imageData, canvas.width, canvas.height);
+
+    vegCount = boxes.length;
+
+    boxes.forEach(([x, y, w, h]) => {
+      // Box
+      ctx.strokeStyle = '#22c55e';
+      ctx.lineWidth   = 2.5;
+      ctx.strokeRect(x, y, w, h);
+      // Label background
+      ctx.fillStyle = '#22c55e';
+      ctx.fillRect(x, y - 22, 110, 22);
+      // Label text
+      ctx.fillStyle   = '#fff';
+      ctx.font        = 'bold 13px system-ui';
+      ctx.fillText('🌿 Vegetation', x + 6, y - 6);
+    });
+
+    // HUD overlay
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(8, 8, 190, 28);
+    ctx.fillStyle = vegCount > 0 ? '#22c55e' : '#9ca3af';
+    ctx.font      = 'bold 13px system-ui';
+    ctx.fillText(vegCount > 0 ? `✔ ${vegCount} vegetation zone${vegCount>1?'s':''} detected` : 'No vegetation detected', 16, 27);
+
+    animFrame = requestAnimationFrame(drawFrame);
+  }
+
   async function startCamera() {
     try {
       camStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
       video.srcObject = camStream;
-      video.style.display = 'block';
+      await new Promise(r => video.onloadedmetadata = r);
+      video.play();
+      canvas.style.display = 'block';
       placeholder.style.display = 'none';
       recBadge.style.display = 'flex';
       camStatus.textContent = 'LIVE';
       camStatus.classList.add('live');
+      drawFrame();
     } catch (e) {
       addLog('Camera error: ' + e.message, '', null);
     }
@@ -470,22 +720,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   function stopCamera() {
     if (!camStream) return;
+    cancelAnimationFrame(animFrame);
     camStream.getTracks().forEach(t => t.stop());
     camStream = null;
     video.srcObject = null;
-    video.style.display = 'none';
+    canvas.style.display = 'none';
     placeholder.style.display = 'flex';
     recBadge.style.display = 'none';
     camStatus.textContent = 'Standby';
     camStatus.classList.remove('live');
-  }
-
-  // ── Notification toast ────────────────────────────────────────────
-  function showToast(msg) {
-    toast.textContent = msg;
-    toast.classList.add('show');
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => toast.classList.remove('show'), 4000);
+    vegCount = 0;
   }
 
   // ── Event log ────────────────────────────────────────────────────
